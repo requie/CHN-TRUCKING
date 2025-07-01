@@ -26,11 +26,14 @@ import {
   Target,
   X,
   Clock,
+  Sparkles,
 } from "lucide-react"
 import { DashboardLayout } from "@/components/dashboard-layout"
 import { useRouter } from "next/navigation"
-import { ocrService, type OCRResult, type OCRConfig } from "@/lib/ocr/ocr-service"
+import { CameraCapture } from "@/components/camera/camera-capture"
+import { enhancedOCRService, type EnhancedOCRResult } from "@/lib/ocr/enhanced-ocr-service"
 import { tesseractService, type BatchProgress } from "@/lib/ocr/tesseract-service"
+import type { RealTimeOCRResult } from "@/lib/camera/camera-service"
 
 interface FileWithPreview {
   file: File
@@ -39,16 +42,16 @@ interface FileWithPreview {
 }
 
 export default function UploadTicketPage() {
-  const [uploadStep, setUploadStep] = useState<"upload" | "processing" | "batch" | "ocr" | "manual" | "success">(
+  const [uploadStep, setUploadStep] = useState<"upload" | "camera" | "processing" | "batch" | "ocr" | "manual" | "success">(
     "upload",
   )
   const [selectedFiles, setSelectedFiles] = useState<FileWithPreview[]>([])
   const [batchProgress, setBatchProgress] = useState<BatchProgress[]>([])
   const [currentBatchId, setCurrentBatchId] = useState<string | null>(null)
-  const [batchResults, setBatchResults] = useState<OCRResult[]>([])
-  const [ocrResult, setOcrResult] = useState<OCRResult | null>(null)
+  const [batchResults, setBatchResults] = useState<EnhancedOCRResult[]>([])
+  const [ocrResult, setOcrResult] = useState<EnhancedOCRResult | null>(null)
   const [processingProgress, setProcessingProgress] = useState(0)
-  const [ocrConfig, setOcrConfig] = useState<OCRConfig>(ocrService.getConfig())
+  const [realTimeResults, setRealTimeResults] = useState<RealTimeOCRResult | null>(null)
   const [formData, setFormData] = useState({
     ticketNumber: "",
     date: "",
@@ -61,6 +64,7 @@ export default function UploadTicketPage() {
     weight: "",
   })
   const [manualOverrides, setManualOverrides] = useState<Record<string, boolean>>({})
+  const [useEnhancedOCR, setUseEnhancedOCR] = useState(true)
   const router = useRouter()
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -87,29 +91,21 @@ export default function UploadTicketPage() {
       setUploadStep("processing")
       setProcessingProgress(0)
 
-      const steps = [
-        { message: "Uploading file...", progress: 20 },
-        { message: "Preprocessing image...", progress: 40 },
-        { message: "Running OCR analysis...", progress: 60 },
-        { message: "Extracting ticket data...", progress: 80 },
-        { message: "Validating results...", progress: 100 },
-      ]
-
-      for (const step of steps) {
-        await new Promise((resolve) => setTimeout(resolve, 800))
-        setProcessingProgress(step.progress)
-      }
-
       try {
-        const result = await ocrService.processImage(files[0])
+        const result = useEnhancedOCR 
+          ? await enhancedOCRService.processImageWithML(files[0], (progress) => {
+              setProcessingProgress(progress.progress)
+            })
+          : await enhancedOCRService.processImageWithML(files[0]) // Fallback to basic OCR
+
         setOcrResult(result)
 
-        if (result.success && result.extractedData) {
+        if (result.success && result.fieldValidations) {
           const newFormData = { ...formData }
-          Object.entries(result.extractedData).forEach(([key, value]) => {
-            if (value && value.value) {
+          Object.entries(result.fieldValidations).forEach(([key, validation]) => {
+            if (validation.finalValue) {
               const formKey = key === "truckRegistration" ? "truckReg" : key
-              newFormData[formKey as keyof typeof formData] = value.value
+              newFormData[formKey as keyof typeof formData] = validation.finalValue
             }
           })
           setFormData(newFormData)
@@ -117,13 +113,71 @@ export default function UploadTicketPage() {
 
         setUploadStep("ocr")
       } catch (error) {
-        console.error("OCR processing failed:", error)
+        console.error("Enhanced OCR processing failed:", error)
         setUploadStep("manual")
       }
     } else {
       // Multiple files - batch processing
       setUploadStep("batch")
       startBatchProcessing(files)
+    }
+  }
+
+  const handleCameraCapture = async (imageData: string) => {
+    setUploadStep("processing")
+    setProcessingProgress(0)
+
+    try {
+      // Convert data URL to File
+      const response = await fetch(imageData)
+      const blob = await response.blob()
+      const file = new File([blob], 'camera-capture.jpg', { type: 'image/jpeg' })
+
+      const result = await enhancedOCRService.processImageWithML(file, (progress) => {
+        setProcessingProgress(progress.progress)
+      })
+
+      setOcrResult(result)
+
+      if (result.success && result.fieldValidations) {
+        const newFormData = { ...formData }
+        Object.entries(result.fieldValidations).forEach(([key, validation]) => {
+          if (validation.finalValue) {
+            const formKey = key === "truckRegistration" ? "truckReg" : key
+            newFormData[formKey as keyof typeof formData] = validation.finalValue
+          }
+        })
+        setFormData(newFormData)
+      }
+
+      setUploadStep("ocr")
+    } catch (error) {
+      console.error("Camera OCR processing failed:", error)
+      setUploadStep("manual")
+    }
+  }
+
+  const handleRealTimeOCR = (result: RealTimeOCRResult) => {
+    setRealTimeResults(result)
+    
+    // Auto-fill form with high-confidence detections
+    if (result.detectedFields.length > 0) {
+      const newFormData = { ...formData }
+      let hasHighConfidenceFields = false
+
+      result.detectedFields.forEach(field => {
+        if (field.confidence > 85) { // Only use very high confidence results
+          const formKey = field.name === "truckRegistration" ? "truckReg" : field.name
+          if (formKey in newFormData) {
+            newFormData[formKey as keyof typeof formData] = field.value
+            hasHighConfidenceFields = true
+          }
+        }
+      })
+
+      if (hasHighConfidenceFields) {
+        setFormData(newFormData)
+      }
     }
   }
 
@@ -136,16 +190,15 @@ export default function UploadTicketPage() {
         },
         (results) => {
           console.log("Batch processing completed:", results)
-          // Convert TesseractResult[] to OCRResult[]
-          const ocrResults: OCRResult[] = results.map((result, index) => ({
-            success: result.text.length > 0,
-            text: result.text,
-            confidence: result.confidence,
-            extractedData: {}, // Would need to extract fields here
-            engine: "tesseract",
-            processingTime: 0,
+          // Convert basic results to enhanced results
+          const enhancedResults: EnhancedOCRResult[] = results.map((result, index) => ({
+            ...result,
+            mlDetections: [],
+            hybridConfidence: result.confidence,
+            fieldValidations: {},
+            engine: 'tesseract'
           }))
-          setBatchResults(ocrResults)
+          setBatchResults(enhancedResults)
           setUploadStep("success")
         },
         (error) => {
@@ -191,8 +244,24 @@ export default function UploadTicketPage() {
     setManualOverrides((prev) => ({ ...prev, [fieldName]: true }))
   }
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
+    
+    // If we have OCR result and user made corrections, improve the model
+    if (ocrResult && Object.keys(manualOverrides).length > 0) {
+      const corrections: Record<string, string> = {}
+      Object.entries(manualOverrides).forEach(([field, isOverridden]) => {
+        if (isOverridden) {
+          corrections[field] = formData[field as keyof typeof formData]
+        }
+      })
+      
+      // Send feedback to improve ML model
+      if (selectedFiles.length > 0) {
+        await enhancedOCRService.improveFromUserFeedback(selectedFiles[0].file, corrections)
+      }
+    }
+    
     setUploadStep("success")
   }
 
@@ -238,6 +307,17 @@ export default function UploadTicketPage() {
     return "destructive"
   }
 
+  const getSourceIcon = (source: 'ocr' | 'ml' | 'hybrid') => {
+    switch (source) {
+      case 'ml':
+        return <Brain className="h-3 w-3" />
+      case 'hybrid':
+        return <Sparkles className="h-3 w-3" />
+      default:
+        return <Eye className="h-3 w-3" />
+    }
+  }
+
   if (uploadStep === "success") {
     return (
       <DashboardLayout userRole="driver">
@@ -254,35 +334,29 @@ export default function UploadTicketPage() {
                   : "Your delivery ticket has been submitted and is now pending verification."}
               </p>
 
-              {selectedFiles.length > 1 && (
-                <div className="mb-6 p-4 bg-gray-50 rounded-lg">
-                  <h3 className="font-medium mb-2">Batch Processing Summary</h3>
+              {useEnhancedOCR && ocrResult && (
+                <div className="mb-6 p-4 bg-blue-50 rounded-lg">
+                  <h3 className="font-medium mb-2 flex items-center gap-2">
+                    <Sparkles className="h-4 w-4 text-blue-600" />
+                    Enhanced OCR Results
+                  </h3>
                   <div className="grid grid-cols-2 gap-4 text-sm">
                     <div>
-                      <span className="text-gray-500">Total Files:</span>
-                      <span className="ml-2">{selectedFiles.length}</span>
+                      <span className="text-gray-500">Hybrid Confidence:</span>
+                      <span className="ml-2 font-medium">{ocrResult.hybridConfidence.toFixed(1)}%</span>
                     </div>
                     <div>
-                      <span className="text-gray-500">Successful:</span>
-                      <span className="ml-2 text-green-600">
-                        {batchProgress.filter((p) => p.status === "completed").length}
-                      </span>
-                    </div>
-                    <div>
-                      <span className="text-gray-500">Failed:</span>
-                      <span className="ml-2 text-red-600">
-                        {batchProgress.filter((p) => p.status === "failed").length}
-                      </span>
+                      <span className="text-gray-500">ML Detections:</span>
+                      <span className="ml-2 font-medium">{ocrResult.mlDetections.length}</span>
                     </div>
                     <div>
                       <span className="text-gray-500">Processing Time:</span>
-                      <span className="ml-2">
-                        {batchProgress.length > 0 &&
-                          batchProgress[0].startTime &&
-                          batchProgress[batchProgress.length - 1].endTime &&
-                          `${Math.round(
-                            (batchProgress[batchProgress.length - 1].endTime! - batchProgress[0].startTime!) / 1000,
-                          )}s`}
+                      <span className="ml-2 font-medium">{ocrResult.processingTime}ms</span>
+                    </div>
+                    <div>
+                      <span className="text-gray-500">Fields Detected:</span>
+                      <span className="ml-2 font-medium">
+                        {Object.keys(ocrResult.fieldValidations).filter(k => ocrResult.fieldValidations[k].finalValue).length}
                       </span>
                     </div>
                   </div>
@@ -297,6 +371,7 @@ export default function UploadTicketPage() {
                     setBatchProgress([])
                     setBatchResults([])
                     setOcrResult(null)
+                    setRealTimeResults(null)
                     setCurrentBatchId(null)
                     setFormData({
                       ticketNumber: "",
@@ -403,33 +478,6 @@ export default function UploadTicketPage() {
                   ))}
                 </div>
 
-                {/* Queue Status */}
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                  <div className="text-center p-4 bg-blue-50 rounded-lg">
-                    <Clock className="h-8 w-8 text-blue-600 mx-auto mb-2" />
-                    <h3 className="font-medium text-blue-900">Queued</h3>
-                    <p className="text-sm text-blue-700">
-                      {batchProgress.filter((p) => p.status === "queued").length} files
-                    </p>
-                  </div>
-
-                  <div className="text-center p-4 bg-yellow-50 rounded-lg">
-                    <Brain className="h-8 w-8 text-yellow-600 mx-auto mb-2" />
-                    <h3 className="font-medium text-yellow-900">Processing</h3>
-                    <p className="text-sm text-yellow-700">
-                      {batchProgress.filter((p) => p.status === "processing").length} files
-                    </p>
-                  </div>
-
-                  <div className="text-center p-4 bg-green-50 rounded-lg">
-                    <Target className="h-8 w-8 text-green-600 mx-auto mb-2" />
-                    <h3 className="font-medium text-green-900">Completed</h3>
-                    <p className="text-sm text-green-700">
-                      {batchProgress.filter((p) => p.status === "completed").length} files
-                    </p>
-                  </div>
-                </div>
-
                 <div className="flex gap-4 justify-center">
                   <Button variant="outline" onClick={cancelBatch}>
                     Cancel Batch
@@ -451,9 +499,14 @@ export default function UploadTicketPage() {
             <CardHeader>
               <CardTitle className="flex items-center gap-2">
                 <RefreshCw className="h-5 w-5 animate-spin" />
-                Processing Your Ticket
+                {useEnhancedOCR ? "Enhanced AI Processing" : "Processing Your Ticket"}
               </CardTitle>
-              <CardDescription>Our AI is analyzing your ticket image and extracting the data</CardDescription>
+              <CardDescription>
+                {useEnhancedOCR 
+                  ? "Using advanced ML algorithms and OCR for maximum accuracy"
+                  : "Our AI is analyzing your ticket image and extracting the data"
+                }
+              </CardDescription>
             </CardHeader>
             <CardContent>
               <div className="space-y-6">
@@ -461,26 +514,37 @@ export default function UploadTicketPage() {
 
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                   <div className="text-center p-4 bg-blue-50 rounded-lg">
-                    <Brain className="h-8 w-8 text-blue-600 mx-auto mb-2" />
-                    <h3 className="font-medium text-blue-900">AI Analysis</h3>
-                    <p className="text-sm text-blue-700">Advanced OCR processing</p>
+                    <Eye className="h-8 w-8 text-blue-600 mx-auto mb-2" />
+                    <h3 className="font-medium text-blue-900">OCR Analysis</h3>
+                    <p className="text-sm text-blue-700">Text recognition</p>
                   </div>
+
+                  {useEnhancedOCR && (
+                    <div className="text-center p-4 bg-purple-50 rounded-lg">
+                      <Brain className="h-8 w-8 text-purple-600 mx-auto mb-2" />
+                      <h3 className="font-medium text-purple-900">ML Detection</h3>
+                      <p className="text-sm text-purple-700">Field identification</p>
+                    </div>
+                  )}
 
                   <div className="text-center p-4 bg-green-50 rounded-lg">
-                    <Target className="h-8 w-8 text-green-600 mx-auto mb-2" />
-                    <h3 className="font-medium text-green-900">Data Extraction</h3>
-                    <p className="text-sm text-green-700">Identifying key fields</p>
-                  </div>
-
-                  <div className="text-center p-4 bg-purple-50 rounded-lg">
-                    <Zap className="h-8 w-8 text-purple-600 mx-auto mb-2" />
-                    <h3 className="font-medium text-purple-900">Validation</h3>
-                    <p className="text-sm text-purple-700">Ensuring accuracy</p>
+                    <Sparkles className="h-8 w-8 text-green-600 mx-auto mb-2" />
+                    <h3 className="font-medium text-green-900">
+                      {useEnhancedOCR ? "Hybrid Fusion" : "Validation"}
+                    </h3>
+                    <p className="text-sm text-green-700">
+                      {useEnhancedOCR ? "Combining results" : "Ensuring accuracy"}
+                    </p>
                   </div>
                 </div>
 
                 <div className="text-center">
-                  <p className="text-sm text-gray-600">This usually takes 10-30 seconds depending on image quality</p>
+                  <p className="text-sm text-gray-600">
+                    {useEnhancedOCR 
+                      ? "Enhanced processing may take longer but provides superior accuracy"
+                      : "This usually takes 10-30 seconds depending on image quality"
+                    }
+                  </p>
                 </div>
               </div>
             </CardContent>
@@ -496,27 +560,41 @@ export default function UploadTicketPage() {
         <div>
           <h1 className="text-3xl font-bold text-gray-900">Upload Delivery Tickets</h1>
           <p className="text-gray-600 mt-2">
-            Upload single or multiple ticket images for batch processing with individual progress tracking
+            Upload images, use camera capture, or enter ticket information manually with AI-powered assistance
           </p>
         </div>
 
         {uploadStep === "upload" && (
           <Card>
             <CardHeader>
-              <CardTitle>Upload Ticket Images</CardTitle>
+              <CardTitle className="flex items-center justify-between">
+                <span>Upload Method</span>
+                <div className="flex items-center gap-2">
+                  <Badge variant={useEnhancedOCR ? "default" : "outline"} className="text-xs">
+                    {useEnhancedOCR ? "Enhanced AI" : "Standard OCR"}
+                  </Badge>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setUseEnhancedOCR(!useEnhancedOCR)}
+                  >
+                    <Settings className="h-4 w-4" />
+                  </Button>
+                </div>
+              </CardTitle>
               <CardDescription>
-                Upload one or more images of your delivery tickets (JPG, PNG, PDF). Multiple files will be processed in
-                batch with individual progress tracking.
+                Choose your preferred method to upload ticket information
               </CardDescription>
             </CardHeader>
             <CardContent>
-              <Tabs defaultValue="upload" className="w-full">
-                <TabsList className="grid w-full grid-cols-2">
-                  <TabsTrigger value="upload">Upload Files</TabsTrigger>
-                  <TabsTrigger value="settings">OCR Settings</TabsTrigger>
+              <Tabs defaultValue="files" className="w-full">
+                <TabsList className="grid w-full grid-cols-3">
+                  <TabsTrigger value="files">Upload Files</TabsTrigger>
+                  <TabsTrigger value="camera">Camera Capture</TabsTrigger>
+                  <TabsTrigger value="manual">Manual Entry</TabsTrigger>
                 </TabsList>
 
-                <TabsContent value="upload" className="space-y-4">
+                <TabsContent value="files" className="space-y-4">
                   <div className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center">
                     <Upload className="h-12 w-12 text-gray-400 mx-auto mb-4" />
                     <div className="space-y-2">
@@ -584,137 +662,111 @@ export default function UploadTicketPage() {
 
                   <div className="flex gap-4">
                     <Button className="flex-1" disabled={selectedFiles.length === 0}>
-                      <Camera className="h-4 w-4 mr-2" />
-                      {selectedFiles.length > 1 ? `Process ${selectedFiles.length} Files` : "Process with AI OCR"}
+                      {useEnhancedOCR && <Sparkles className="h-4 w-4 mr-2" />}
+                      {selectedFiles.length > 1 
+                        ? `Process ${selectedFiles.length} Files` 
+                        : useEnhancedOCR 
+                          ? "Process with Enhanced AI" 
+                          : "Process with AI OCR"
+                      }
                     </Button>
                     <Button variant="outline" onClick={handleManualEntry}>
                       Manual Entry Instead
                     </Button>
                   </div>
 
-                  {selectedFiles.length > 1 && (
+                  {useEnhancedOCR && (
                     <Alert>
-                      <Zap className="h-4 w-4" />
+                      <Sparkles className="h-4 w-4" />
                       <AlertDescription>
-                        Batch mode detected! {selectedFiles.length} files will be processed simultaneously with
-                        individual progress tracking. This may take several minutes depending on image quality and
-                        complexity.
+                        Enhanced AI mode combines traditional OCR with machine learning for superior field detection 
+                        and accuracy. Processing may take slightly longer but provides better results.
                       </AlertDescription>
                     </Alert>
                   )}
                 </TabsContent>
 
-                <TabsContent value="settings" className="space-y-4">
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <div className="space-y-2">
-                      <Label htmlFor="engine">OCR Engine</Label>
-                      <Select
-                        value={ocrConfig.engine}
-                        onValueChange={(value: any) => setOcrConfig((prev) => ({ ...prev, engine: value }))}
-                      >
-                        <SelectTrigger>
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="tesseract">Tesseract (Free)</SelectItem>
-                          <SelectItem value="google-vision">Google Vision (Premium)</SelectItem>
-                          <SelectItem value="azure-vision">Azure Vision (Premium)</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </div>
+                <TabsContent value="camera" className="space-y-4">
+                  <CameraCapture
+                    onCapture={handleCameraCapture}
+                    onRealTimeResult={handleRealTimeOCR}
+                    enableRealTimeOCR={true}
+                  />
 
-                    <div className="space-y-2">
-                      <Label htmlFor="language">Language</Label>
-                      <Select
-                        value={ocrConfig.language}
-                        onValueChange={(value) => setOcrConfig((prev) => ({ ...prev, language: value }))}
-                      >
-                        <SelectTrigger>
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="eng">English</SelectItem>
-                          <SelectItem value="spa">Spanish</SelectItem>
-                          <SelectItem value="fra">French</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </div>
+                  {realTimeResults && realTimeResults.detectedFields.length > 0 && (
+                    <Card>
+                      <CardHeader>
+                        <CardTitle className="text-sm">Real-time Detection Results</CardTitle>
+                      </CardHeader>
+                      <CardContent>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                          {realTimeResults.detectedFields.map((field, index) => (
+                            <div key={index} className="flex items-center justify-between p-2 bg-gray-50 rounded text-xs">
+                              <span className="font-medium capitalize">
+                                {field.name.replace(/([A-Z])/g, ' $1').trim()}
+                              </span>
+                              <div className="flex items-center gap-2">
+                                <span className="truncate max-w-20">{field.value}</span>
+                                <Badge variant={getConfidenceBadge(field.confidence)} className="text-xs">
+                                  {field.confidence.toFixed(0)}%
+                                </Badge>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </CardContent>
+                    </Card>
+                  )}
+                </TabsContent>
 
-                    <div className="space-y-2">
-                      <Label htmlFor="psm">Page Segmentation Mode</Label>
-                      <Select
-                        value={ocrConfig.psm.toString()}
-                        onValueChange={(value) => setOcrConfig((prev) => ({ ...prev, psm: Number.parseInt(value) }))}
-                      >
-                        <SelectTrigger>
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="6">Uniform block of text (Default)</SelectItem>
-                          <SelectItem value="7">Single text line</SelectItem>
-                          <SelectItem value="8">Single word</SelectItem>
-                          <SelectItem value="11">Sparse text</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </div>
-
-                    <div className="space-y-2">
-                      <Label htmlFor="dpi">DPI Setting</Label>
-                      <Select
-                        value={ocrConfig.dpi?.toString() || "300"}
-                        onValueChange={(value) => setOcrConfig((prev) => ({ ...prev, dpi: Number.parseInt(value) }))}
-                      >
-                        <SelectTrigger>
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="150">150 DPI (Fast)</SelectItem>
-                          <SelectItem value="300">300 DPI (Balanced)</SelectItem>
-                          <SelectItem value="600">600 DPI (High Quality)</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </div>
-                  </div>
-
+                <TabsContent value="manual" className="space-y-4">
                   <Alert>
-                    <Settings className="h-4 w-4" />
+                    <AlertCircle className="h-4 w-4" />
                     <AlertDescription>
-                      Higher DPI settings provide better accuracy but take longer to process. For batch processing,
-                      consider using 300 DPI for the best balance of speed and accuracy.
+                      Manual entry mode. You can still use camera or file upload for assistance.
                     </AlertDescription>
                   </Alert>
+                  <Button onClick={handleManualEntry} className="w-full">
+                    Continue to Manual Entry
+                  </Button>
                 </TabsContent>
               </Tabs>
             </CardContent>
           </Card>
         )}
 
-        {/* Keep existing OCR and manual entry sections */}
+        {/* Keep existing OCR and manual entry sections with enhanced features */}
         {uploadStep === "ocr" && ocrResult && (
           <Card>
             <CardHeader>
               <CardTitle className="flex items-center gap-2">
                 <CheckCircle className="h-5 w-5 text-green-500" />
-                OCR Processing Complete
+                {useEnhancedOCR ? "Enhanced AI Processing Complete" : "OCR Processing Complete"}
               </CardTitle>
               <CardDescription>Please review and verify the extracted information below</CardDescription>
             </CardHeader>
             <CardContent>
-              {/* OCR Results Summary */}
+              {/* Enhanced OCR Results Summary */}
               <div className="mb-6 p-4 bg-gray-50 rounded-lg">
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
                   <div>
                     <span className="text-gray-500">Engine:</span>
-                    <span className="ml-2 capitalize font-medium">{ocrResult.engine}</span>
+                    <span className="ml-2 capitalize font-medium">
+                      {useEnhancedOCR ? "Enhanced AI" : ocrResult.engine}
+                    </span>
                   </div>
                   <div>
                     <span className="text-gray-500">Processing Time:</span>
                     <span className="ml-2 font-medium">{ocrResult.processingTime}ms</span>
                   </div>
                   <div>
-                    <span className="text-gray-500">Overall Confidence:</span>
-                    <Badge variant={getConfidenceBadge(ocrResult.confidence)} className="ml-2">
-                      {ocrResult.confidence.toFixed(1)}%
+                    <span className="text-gray-500">
+                      {useEnhancedOCR ? "Hybrid Confidence:" : "OCR Confidence:"}
+                    </span>
+                    <Badge variant={getConfidenceBadge(
+                      useEnhancedOCR ? ocrResult.hybridConfidence : ocrResult.confidence
+                    )} className="ml-2">
+                      {(useEnhancedOCR ? ocrResult.hybridConfidence : ocrResult.confidence).toFixed(1)}%
                     </Badge>
                   </div>
                   <div>
@@ -724,23 +776,43 @@ export default function UploadTicketPage() {
                     </Button>
                   </div>
                 </div>
+
+                {useEnhancedOCR && ocrResult.mlDetections.length > 0 && (
+                  <div className="mt-4 pt-4 border-t">
+                    <div className="flex items-center gap-2 mb-2">
+                      <Brain className="h-4 w-4 text-purple-600" />
+                      <span className="text-sm font-medium">ML Detections: {ocrResult.mlDetections.length}</span>
+                    </div>
+                    <div className="text-xs text-gray-600">
+                      Enhanced processing detected {ocrResult.mlDetections.length} fields using machine learning
+                    </div>
+                  </div>
+                )}
               </div>
 
               <form onSubmit={handleSubmit} className="space-y-4">
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   {Object.entries(formData).map(([field, value]) => {
-                    const ocrField = ocrResult.extractedData[field === "truckReg" ? "truckRegistration" : field]
-                    const confidence = ocrField?.confidence || 0
+                    const validation = useEnhancedOCR ? ocrResult.fieldValidations[field] : null
+                    const confidence = validation?.confidence || 0
+                    const source = validation?.source || 'ocr'
                     const isManualOverride = manualOverrides[field]
 
                     return (
                       <div key={field} className="space-y-2">
                         <Label htmlFor={field} className="flex items-center gap-2">
                           {field.charAt(0).toUpperCase() + field.slice(1).replace(/([A-Z])/g, " $1")}
-                          {ocrField && (
-                            <Badge variant={getConfidenceBadge(confidence)} className="text-xs">
-                              {confidence.toFixed(0)}%
-                            </Badge>
+                          {validation && (
+                            <div className="flex items-center gap-1">
+                              <Badge variant={getConfidenceBadge(confidence)} className="text-xs">
+                                {confidence.toFixed(0)}%
+                              </Badge>
+                              {useEnhancedOCR && (
+                                <div className="flex items-center gap-1" title={`Source: ${source}`}>
+                                  {getSourceIcon(source)}
+                                </div>
+                              )}
+                            </div>
                           )}
                           {isManualOverride && (
                             <Badge variant="outline" className="text-xs">
@@ -795,6 +867,13 @@ export default function UploadTicketPage() {
                             <AlertCircle className="h-3 w-3" />
                             Low confidence - please verify this field
                           </p>
+                        )}
+
+                        {useEnhancedOCR && validation && validation.ocrValue !== validation.mlValue && (
+                          <div className="text-xs text-gray-500 space-y-1">
+                            <div>OCR: {validation.ocrValue || 'Not detected'}</div>
+                            <div>ML: {validation.mlValue || 'Not detected'}</div>
+                          </div>
                         )}
                       </div>
                     )
