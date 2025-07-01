@@ -12,6 +12,7 @@ import { Progress } from "@/components/ui/progress"
 import { Badge } from "@/components/ui/badge"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import {
   Upload,
   Camera,
@@ -27,6 +28,7 @@ import {
   X,
   Clock,
   Sparkles,
+  Download,
 } from "lucide-react"
 import { DashboardLayout } from "@/components/dashboard-layout"
 import { useRouter } from "next/navigation"
@@ -41,6 +43,20 @@ interface FileWithPreview {
   id: string
 }
 
+interface ProcessedTicket {
+  no: string
+  date: string
+  commodity: string
+  truckRegNo: string
+  loadingLocation: string
+  destination: string
+  driver: string
+  dispatcher: string
+  tons: string
+  confidence: number
+  source: string
+}
+
 export default function UploadTicketPage() {
   const [uploadStep, setUploadStep] = useState<"upload" | "camera" | "processing" | "batch" | "ocr" | "manual" | "success">(
     "upload",
@@ -48,7 +64,7 @@ export default function UploadTicketPage() {
   const [selectedFiles, setSelectedFiles] = useState<FileWithPreview[]>([])
   const [batchProgress, setBatchProgress] = useState<BatchProgress[]>([])
   const [currentBatchId, setCurrentBatchId] = useState<string | null>(null)
-  const [batchResults, setBatchResults] = useState<EnhancedOCRResult[]>([])
+  const [batchResults, setBatchResults] = useState<ProcessedTicket[]>([])
   const [ocrResult, setOcrResult] = useState<EnhancedOCRResult | null>(null)
   const [processingProgress, setProcessingProgress] = useState(0)
   const [realTimeResults, setRealTimeResults] = useState<RealTimeOCRResult | null>(null)
@@ -183,33 +199,71 @@ export default function UploadTicketPage() {
 
   const startBatchProcessing = async (files: File[]) => {
     try {
-      const batchId = await tesseractService.processBatch(
+      // Use enhanced OCR service for batch processing
+      const results = await enhancedOCRService.processBatchWithML(
         files,
-        (progress) => {
-          setBatchProgress(progress)
-        },
-        (results) => {
-          console.log("Batch processing completed:", results)
-          // Convert basic results to enhanced results
-          const enhancedResults: EnhancedOCRResult[] = results.map((result, index) => ({
-            ...result,
-            mlDetections: [],
-            hybridConfidence: result.confidence,
-            fieldValidations: {},
-            engine: 'tesseract'
-          }))
-          setBatchResults(enhancedResults)
-          setUploadStep("success")
-        },
-        (error) => {
-          console.error("Batch processing failed:", error)
-          setUploadStep("manual")
-        },
+        (fileIndex, progress) => {
+          // Update batch progress
+          setBatchProgress(prev => {
+            const updated = [...prev]
+            if (!updated[fileIndex]) {
+              updated[fileIndex] = {
+                imageIndex: fileIndex,
+                fileName: files[fileIndex].name,
+                status: "processing",
+                progress: progress.progress,
+                startTime: Date.now()
+              }
+            } else {
+              updated[fileIndex] = {
+                ...updated[fileIndex],
+                progress: progress.progress,
+                status: progress.progress === 100 ? "completed" : "processing"
+              }
+            }
+            return updated
+          })
+        }
       )
 
-      setCurrentBatchId(batchId)
+      // Convert results to ProcessedTicket format
+      const processedTickets: ProcessedTicket[] = results.map((result, index) => {
+        if (!result.success) {
+          return {
+            no: "Unknown",
+            date: "",
+            commodity: "",
+            truckRegNo: "",
+            loadingLocation: "",
+            destination: "",
+            driver: "",
+            dispatcher: "",
+            tons: "",
+            confidence: 0,
+            source: "Error"
+          }
+        }
+
+        const validations = result.fieldValidations || {}
+        return {
+          no: validations.ticketNumber?.finalValue || "Unknown",
+          date: validations.date?.finalValue || "",
+          commodity: validations.commodity?.finalValue || "",
+          truckRegNo: validations.truckRegistration?.finalValue || "",
+          loadingLocation: validations.loadingLocation?.finalValue || "",
+          destination: validations.destination?.finalValue || "",
+          driver: validations.driverName?.finalValue || "",
+          dispatcher: validations.dispatcher?.finalValue || "",
+          tons: validations.weight?.finalValue || "",
+          confidence: result.hybridConfidence || result.confidence,
+          source: useEnhancedOCR ? "Enhanced AI" : "OCR"
+        }
+      })
+
+      setBatchResults(processedTickets)
+      setUploadStep("success")
     } catch (error) {
-      console.error("Failed to start batch processing:", error)
+      console.error("Batch processing failed:", error)
       setUploadStep("manual")
     }
   }
@@ -262,11 +316,64 @@ export default function UploadTicketPage() {
       }
     }
     
+    // Convert single result to ProcessedTicket format
+    const processedTicket: ProcessedTicket = {
+      no: formData.ticketNumber || "Unknown",
+      date: formData.date,
+      commodity: formData.commodity,
+      truckRegNo: formData.truckReg,
+      loadingLocation: formData.loadingLocation,
+      destination: formData.destination,
+      driver: formData.driverName,
+      dispatcher: formData.dispatcher,
+      tons: formData.weight,
+      confidence: ocrResult?.hybridConfidence || ocrResult?.confidence || 100,
+      source: ocrResult ? (useEnhancedOCR ? "Enhanced AI" : "OCR") : "Manual"
+    }
+    
+    setBatchResults([processedTicket])
     setUploadStep("success")
   }
 
   const handleInputChange = (field: string, value: string) => {
     setFormData((prev) => ({ ...prev, [field]: value }))
+  }
+
+  const exportData = (format: 'csv' | 'json') => {
+    if (format === 'csv') {
+      const headers = ['No.', 'Date', 'Commodity', 'Truck Reg. No.', 'Loading Location', 'Destination', 'Driver', 'Dispatcher', 'Tons']
+      const csvContent = [
+        headers.join(','),
+        ...batchResults.map(ticket => [
+          ticket.no,
+          ticket.date,
+          ticket.commodity,
+          ticket.truckRegNo,
+          ticket.loadingLocation,
+          ticket.destination,
+          ticket.driver,
+          ticket.dispatcher,
+          ticket.tons
+        ].map(field => `"${field}"`).join(','))
+      ].join('\n')
+
+      const blob = new Blob([csvContent], { type: 'text/csv' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `trucking-tickets-${new Date().toISOString().split('T')[0]}.csv`
+      a.click()
+      URL.revokeObjectURL(url)
+    } else if (format === 'json') {
+      const jsonContent = JSON.stringify(batchResults, null, 2)
+      const blob = new Blob([jsonContent], { type: 'application/json' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `trucking-tickets-${new Date().toISOString().split('T')[0]}.json`
+      a.click()
+      URL.revokeObjectURL(url)
+    }
   }
 
   const getStatusColor = (status: BatchProgress["status"]) => {
@@ -321,42 +428,140 @@ export default function UploadTicketPage() {
   if (uploadStep === "success") {
     return (
       <DashboardLayout userRole="driver">
-        <div className="max-w-2xl mx-auto">
+        <div className="max-w-6xl mx-auto space-y-6">
           <Card>
-            <CardContent className="pt-6 text-center">
-              <CheckCircle className="h-16 w-16 text-green-500 mx-auto mb-4" />
-              <h2 className="text-2xl font-bold text-gray-900 mb-2">
-                {selectedFiles.length > 1 ? "Batch Upload Completed!" : "Ticket Uploaded Successfully!"}
-              </h2>
-              <p className="text-gray-600 mb-6">
-                {selectedFiles.length > 1
-                  ? `${selectedFiles.length} tickets have been processed and submitted.`
-                  : "Your delivery ticket has been submitted and is now pending verification."}
-              </p>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <CheckCircle className="h-6 w-6 text-green-500" />
+                {batchResults.length > 1 ? "Batch Processing Complete!" : "Ticket Processing Complete!"}
+              </CardTitle>
+              <CardDescription>
+                {batchResults.length > 1
+                  ? `${batchResults.length} tickets have been processed and are ready for review.`
+                  : "Your delivery ticket has been processed and is ready for submission."}
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-6">
+              {/* Export Options */}
+              <div className="flex gap-4 justify-between items-center">
+                <div className="flex gap-2">
+                  <Button onClick={() => exportData('csv')} variant="outline">
+                    <Download className="h-4 w-4 mr-2" />
+                    Export CSV
+                  </Button>
+                  <Button onClick={() => exportData('json')} variant="outline">
+                    <Download className="h-4 w-4 mr-2" />
+                    Export JSON
+                  </Button>
+                </div>
+                <Badge variant="secondary">
+                  {batchResults.length} ticket{batchResults.length !== 1 ? 's' : ''} processed
+                </Badge>
+              </div>
 
-              {useEnhancedOCR && ocrResult && (
-                <div className="mb-6 p-4 bg-blue-50 rounded-lg">
+              {/* Results Table */}
+              <div className="border rounded-lg overflow-hidden">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>No.</TableHead>
+                      <TableHead>Date</TableHead>
+                      <TableHead>Commodity</TableHead>
+                      <TableHead>Truck Reg. No.</TableHead>
+                      <TableHead>Loading Location</TableHead>
+                      <TableHead>Destination</TableHead>
+                      <TableHead>Driver</TableHead>
+                      <TableHead>Dispatcher</TableHead>
+                      <TableHead>Tons</TableHead>
+                      <TableHead>Confidence</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {batchResults.map((ticket, index) => (
+                      <TableRow key={index}>
+                        <TableCell className="font-medium">{ticket.no}</TableCell>
+                        <TableCell>{ticket.date}</TableCell>
+                        <TableCell>{ticket.commodity}</TableCell>
+                        <TableCell>{ticket.truckRegNo}</TableCell>
+                        <TableCell>{ticket.loadingLocation}</TableCell>
+                        <TableCell>{ticket.destination}</TableCell>
+                        <TableCell>{ticket.driver}</TableCell>
+                        <TableCell>{ticket.dispatcher}</TableCell>
+                        <TableCell>{ticket.tons}</TableCell>
+                        <TableCell>
+                          <Badge variant={getConfidenceBadge(ticket.confidence)}>
+                            {ticket.confidence.toFixed(1)}%
+                          </Badge>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+
+              {/* Summary Statistics */}
+              <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                <Card>
+                  <CardContent className="pt-6">
+                    <div className="text-2xl font-bold">{batchResults.length}</div>
+                    <p className="text-xs text-muted-foreground">Total Tickets</p>
+                  </CardContent>
+                </Card>
+                <Card>
+                  <CardContent className="pt-6">
+                    <div className="text-2xl font-bold text-green-600">
+                      {batchResults.filter(t => t.confidence >= 80).length}
+                    </div>
+                    <p className="text-xs text-muted-foreground">High Confidence</p>
+                  </CardContent>
+                </Card>
+                <Card>
+                  <CardContent className="pt-6">
+                    <div className="text-2xl font-bold">
+                      {batchResults.reduce((sum, t) => sum + (parseFloat(t.tons) || 0), 0).toFixed(2)}
+                    </div>
+                    <p className="text-xs text-muted-foreground">Total Tons</p>
+                  </CardContent>
+                </Card>
+                <Card>
+                  <CardContent className="pt-6">
+                    <div className="text-2xl font-bold">
+                      {(batchResults.reduce((sum, t) => sum + t.confidence, 0) / batchResults.length).toFixed(1)}%
+                    </div>
+                    <p className="text-xs text-muted-foreground">Avg Confidence</p>
+                  </CardContent>
+                </Card>
+              </div>
+
+              {useEnhancedOCR && (
+                <div className="p-4 bg-blue-50 rounded-lg">
                   <h3 className="font-medium mb-2 flex items-center gap-2">
                     <Sparkles className="h-4 w-4 text-blue-600" />
-                    Enhanced OCR Results
+                    Enhanced AI Processing Summary
                   </h3>
-                  <div className="grid grid-cols-2 gap-4 text-sm">
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
                     <div>
-                      <span className="text-gray-500">Hybrid Confidence:</span>
-                      <span className="ml-2 font-medium">{ocrResult.hybridConfidence.toFixed(1)}%</span>
+                      <span className="text-gray-500">Processing Mode:</span>
+                      <span className="ml-2 font-medium">Enhanced AI</span>
                     </div>
                     <div>
                       <span className="text-gray-500">ML Detections:</span>
-                      <span className="ml-2 font-medium">{ocrResult.mlDetections.length}</span>
-                    </div>
-                    <div>
-                      <span className="text-gray-500">Processing Time:</span>
-                      <span className="ml-2 font-medium">{ocrResult.processingTime}ms</span>
+                      <span className="ml-2 font-medium">
+                        {batchResults.filter(t => t.source.includes('AI')).length}
+                      </span>
                     </div>
                     <div>
                       <span className="text-gray-500">Fields Detected:</span>
                       <span className="ml-2 font-medium">
-                        {Object.keys(ocrResult.fieldValidations).filter(k => ocrResult.fieldValidations[k].finalValue).length}
+                        {batchResults.reduce((sum, t) => {
+                          return sum + Object.values(t).filter(v => v && v !== "Unknown" && v !== "").length - 2 // Exclude confidence and source
+                        }, 0)}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-gray-500">Success Rate:</span>
+                      <span className="ml-2 font-medium">
+                        {((batchResults.filter(t => t.confidence > 70).length / batchResults.length) * 100).toFixed(1)}%
                       </span>
                     </div>
                   </div>
@@ -387,7 +592,7 @@ export default function UploadTicketPage() {
                     setManualOverrides({})
                   }}
                 >
-                  Upload More Tickets
+                  Process More Tickets
                 </Button>
                 <Button variant="outline" onClick={() => router.push("/dashboard/driver")}>
                   Back to Dashboard

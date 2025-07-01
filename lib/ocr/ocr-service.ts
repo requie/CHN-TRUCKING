@@ -68,9 +68,10 @@ class OCRService {
     {
       name: "ticketNumber",
       patterns: [
-        /(?:ticket|ref|no|number)[\s\w]*:?\s*([A-Z0-9-]{3,20})/i,
+        /(?:slip|ticket|ref|no|number)[\s\w]*:?\s*([A-Z0-9-]{3,20})/i,
         /\b(T[KT]?[-\s]?\d{4,8})\b/i,
         /\b([A-Z]{2,3}[-\s]?\d{4,8})\b/i,
+        /\b(\d{4})\b/i, // 4-digit slip numbers
       ],
       validator: (value) => /^[A-Z0-9-]{3,20}$/i.test(value),
       transformer: (value) => value.toUpperCase().trim(),
@@ -78,16 +79,19 @@ class OCRService {
     {
       name: "date",
       patterns: [
-        /(?:date|issued?)[\s\w]*:?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{4})/i,
+        /(?:date|issued?)[\s\w]*:?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})/i,
         /(?:date|issued?)[\s\w]*:?\s*(\d{4}[/-]\d{1,2}[/-]\d{1,2})/i,
-        /\b(\d{1,2}[/-]\d{1,2}[/-]\d{4})\b/,
+        /\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b/,
         /\b(\d{4}[/-]\d{1,2}[/-]\d{1,2})\b/,
       ],
       validator: (value) => !isNaN(Date.parse(value)),
       transformer: (value) => {
-        // Normalize date format to YYYY-MM-DD
+        // Normalize date format to DD/MM/YY
         const date = new Date(value)
-        return date.toISOString().split("T")[0]
+        const day = date.getDate().toString().padStart(2, '0')
+        const month = (date.getMonth() + 1).toString().padStart(2, '0')
+        const year = date.getFullYear().toString().slice(-2)
+        return `${day}/${month}/${year}`
       },
     },
     {
@@ -98,7 +102,7 @@ class OCRService {
         /(?:plate|license)[\s\w]*:?\s*([A-Z0-9-]{3,10})/i,
       ],
       validator: (value) => /^[A-Z0-9-]{3,10}$/i.test(value),
-      transformer: (value) => value.toUpperCase().replace(/\s+/g, "-").trim(),
+      transformer: (value) => value.toUpperCase().replace(/[-\s]/g, '').trim(),
     },
     {
       name: "driverName",
@@ -121,18 +125,22 @@ class OCRService {
     {
       name: "weight",
       patterns: [
-        /(?:weight|net weight|gross)[\s\w]*:?\s*(\d+\.?\d*)\s*(?:tons?|t|kg)/i,
+        /(?:weight|net weight|gross|tonnage|tons?)[\s\w]*:?\s*(\d+\.?\d*)\s*(?:tons?|t|kg)?/i,
         /(\d+\.?\d*)\s*(?:tons?|t)\b/i,
         /(?:weight)[\s\w]*:?\s*(\d+\.?\d*)/i,
       ],
-      validator: (value) => !isNaN(Number.parseFloat(value)) && Number.parseFloat(value) > 0,
-      transformer: (value) => Number.parseFloat(value).toFixed(1),
+      validator: (value) => {
+        const num = parseFloat(value)
+        return !isNaN(num) && num >= 10.00 && num <= 40.00
+      },
+      transformer: (value) => parseFloat(value).toFixed(2),
     },
     {
       name: "loadingLocation",
       patterns: [
         /(?:from|origin|loading|pickup)[\s\w]*:?\s*([A-Z][a-zA-Z\s]{2,50})/i,
         /(?:mine|site|plant)[\s\w]*:?\s*([A-Z][a-zA-Z\s\d]{2,50})/i,
+        /(?:st\.?\s+jago|jago)\s*(mine)?/i,
       ],
       validator: (value) => value.length >= 3 && value.length <= 50,
       transformer: (value) => value.trim(),
@@ -142,6 +150,7 @@ class OCRService {
       patterns: [
         /(?:to|destination|delivery|drop)[\s\w]*:?\s*([A-Z][a-zA-Z\s]{2,50})/i,
         /(?:port|terminal|plant)[\s\w]*:?\s*([A-Z][a-zA-Z\s\d]{2,50})/i,
+        /\b(jamalco|port\s+esquivel|kingston\s+port)\b/i,
       ],
       validator: (value) => value.length >= 3 && value.length <= 50,
       transformer: (value) => value.trim(),
@@ -150,9 +159,10 @@ class OCRService {
       name: "dispatcher",
       patterns: [
         /(?:dispatcher|coordinator|supervisor)[\s\w]*:?\s*([A-Z][a-z]+\s+[A-Z][a-z]+)/i,
-        /(?:authorized by|approved by)[\s\w]*:?\s*([A-Z][a-z]+\s+[A-Z][a-z]+)/i,
+        /(?:authorized by|approved by|signature)[\s\w]*:?\s*([A-Z][a-z]+\s+[A-Z][a-z]+)/i,
+        /(?:a\.?\s*bailey|bailey)/i,
       ],
-      validator: (value) => /^[A-Za-z\s]{2,30}$/.test(value),
+      validator: (value) => /^[A-Za-z\s\.]{2,30}$/.test(value),
       transformer: (value) => value.trim().replace(/\s+/g, " "),
     },
   ]
