@@ -104,8 +104,8 @@ class TesseractService {
 
         const finalConfig = { ...this.defaultConfig, ...config }
 
-        await worker.loadLanguage(finalConfig.language)
-        await worker.initialize(finalConfig.language)
+        // Use the updated Tesseract.js API - load method combines language loading and initialization
+        await worker.load(finalConfig.language)
 
         await worker.setParameters({
           tessedit_pageseg_mode: finalConfig.psm.toString(),
