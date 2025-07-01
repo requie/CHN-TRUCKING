@@ -100,14 +100,7 @@ class TesseractService {
       this.scheduler = createScheduler()
 
       for (let i = 0; i < this.maxWorkers; i++) {
-        const worker = await createWorker({
-          logger: (m) => {
-            // Progress will be handled per job
-            if (m.status !== "recognizing text") {
-              console.log(`Worker ${i + 1}:`, m)
-            }
-          },
-        })
+        const worker = await createWorker()
 
         const finalConfig = { ...this.defaultConfig, ...config }
 
